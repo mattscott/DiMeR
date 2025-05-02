@@ -223,7 +223,7 @@ def preprocess_input_image(input_image):
     output_image: PIL.Image, (3, 512, 512), mode = RGB, background = white
     """
     image = remove_background(to_rgb_image(input_image)[0], rembg_session, bgcolor=(255, 255, 255, 255))
-    image = resize_foreground(image, ratio=0.85, pad_value=255)
+    image = resize_foreground(image, ratio=0.85)
     return to_rgb_image(image)[0]
 
 

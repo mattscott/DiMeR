@@ -2,7 +2,7 @@ import importlib
 import sys
 
 # List modules to force reload
-modules_to_reload = ['pipeline.kiss3d_wrapper', 'models.zero123plus.pipeline']
+modules_to_reload = ['pipeline.mv_kiss3d_wrapper']
 
 for module_name in modules_to_reload:
     if module_name in sys.modules:
@@ -21,10 +21,13 @@ import ctypes
 import shlex
 import torch
 import argparse
+import torchvision
+import numpy as np
+from PIL import Image
 print(f'gradio version: {gr.__version__}')
 
 # Add command line argument parsing
-parser = argparse.ArgumentParser(description='DiMeR Image-to-3D Demo')
+parser = argparse.ArgumentParser(description='DiMeR Multi-View Image-to-3D Demo')
 parser.add_argument('--ui_only', action='store_true', help='Only load the UI interface, do not initialize models (for UI debugging)')
 args = parser.parse_args()
 
@@ -36,7 +39,6 @@ processed_image = False
 
 @spaces.GPU
 def check_gpu():
-    #subprocess.run(['nvidia-smi'])  # Test if CUDA is available
     print(f"torch.cuda.is_available:{torch.cuda.is_available()}")
     print("Device count:", torch.cuda.device_count()) 
 
@@ -56,7 +58,6 @@ import shutil
 import json
 import requests
 import threading
-from PIL import Image
 import time
 import trimesh
 import random
@@ -65,7 +66,8 @@ import numpy as np
 
 # Only import video rendering module and initialize models in non-UI debug mode
 if not UI_ONLY_MODE:
-    from pipeline.kiss3d_wrapper import init_wrapper_from_config, run_image_to_3d, image2mesh_preprocess, image2mesh_main
+    from pipeline.mv_kiss3d_wrapper import init_wrapper_from_config, image2mesh_main
+    from pipeline.utils import TMP_DIR, OUT_DIR
 
 # Add logo file path and hyperlinks
 LOGO_PATH = "app_assets/logo_temp_.png"
@@ -87,33 +89,70 @@ def save_cached_mesh():
     print('save_cached_mesh() called')
     return mesh_cache
 
+def combine_multi_view_images(front_img, back_img, left_img, right_img):
+    """Combine 4 view images into a single bundle image"""
+    # Convert PIL images to tensors
+    front_tensor = torchvision.transforms.functional.to_tensor(front_img)
+    back_tensor = torchvision.transforms.functional.to_tensor(back_img)
+    left_tensor = torchvision.transforms.functional.to_tensor(left_img)
+    right_tensor = torchvision.transforms.functional.to_tensor(right_img)
+    
+    # Stack images in the correct order (front, right, back, left)
+    rgb_images = torch.stack([front_tensor, right_tensor, back_tensor, left_tensor])
+    
+    # Create normal maps (placeholder for now)
+    normal_images = torch.ones_like(rgb_images)
+    
+    # Combine into final bundle image
+    bundle_image = torch.cat([rgb_images, normal_images], dim=0)
+    bundle_image = torchvision.utils.make_grid(bundle_image, nrow=4, padding=0)
+    
+    # Save intermediate result
+    save_path = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_ref_3d_bundle_image.png')
+    torchvision.utils.save_image(bundle_image, save_path)
+    
+    return bundle_image, save_path
+
 @spaces.GPU(duration=120)
-def image2mesh_preprocess_(input_image_, seed, use_mv_rgb=True):
+def mv_image2mesh_preprocess_(front_img, back_img, left_img, right_img, seed):
     global preprocessed_input_image
+
+    print (f"mv_image2mesh_preprocess_() called with seed: {seed}")
     seed = int(seed) if seed is not None else None
     
-    input_image_save_path, reference_save_path, caption = image2mesh_preprocess(k3d_wrapper, input_image_, seed, use_mv_rgb)
-    preprocessed_input_image = Image.open(input_image_save_path)
+    # Combine the multi-view images into a bundle
+    reference_3d_bundle_image, reference_save_path = combine_multi_view_images(front_img, back_img, left_img, right_img)
+    
+    # Use front image for captioning and set as preprocessed input
+    preprocessed_input_image = front_img
+    caption = k3d_wrapper.get_image_caption(front_img)
+    
     return reference_save_path, caption
 
 @spaces.GPU(duration=120)
-def image2mesh_main_(reference_3d_bundle_image, caption, seed, strength1=0.5, strength2=0.95, enable_redux=True, use_controlnet=True):
-    #subprocess.run(['nvidia-smi'])  
+def mv_image2mesh_main_(reference_3d_bundle_image, caption, seed, strength1=0.5, strength2=0.95, enable_redux=True, use_controlnet=True):
     global mesh_cache 
+    print (f"mv_image2mesh_main_() called with seed: {caption}")
     seed = int(seed) if seed is not None else None
 
-    input_image = preprocessed_input_image
+    # Convert reference image to tensor
     reference_3d_bundle_image = torch.tensor(reference_3d_bundle_image).permute(2,0,1)/255
 
-    gen_save_path, recon_mesh_path = image2mesh_main(k3d_wrapper, input_image, reference_3d_bundle_image, caption=caption, seed=seed, strength1=strength1, strength2=strength2, enable_redux=enable_redux, use_controlnet=use_controlnet)
+    # Generate 3D model
+    gen_save_path, recon_mesh_path = image2mesh_main(
+        k3d_wrapper, 
+        preprocessed_input_image,  # Use the preprocessed input image
+        reference_3d_bundle_image, 
+        caption=caption, 
+        seed=seed, 
+        strength1=strength1, 
+        strength2=strength2, 
+        enable_redux=enable_redux, 
+        use_controlnet=use_controlnet
+    )
+    
     mesh_cache = recon_mesh_path
-
     return gen_save_path, recon_mesh_path, mesh_cache
-
-def image_to_base64(image_path):
-    """Converts an image file to a base64-encoded string."""
-    with open(image_path, "rb") as img_file:
-        return base64.b64encode(img_file.read()).decode('utf-8')
 
 if not UI_ONLY_MODE:
     torch.set_grad_enabled(False)
@@ -163,7 +202,7 @@ with gr.Blocks(css="""
         with gr.Column(scale=7, elem_id="center-align-column"):
             gr.Markdown(f"""
             # Official 🤗 Gradio Demo
-            # DiMeR: Image-to-3D Generation""")
+            # DiMeR: Multi-View Image-to-3D Generation""")
             
             gr.HTML(f"""
             <div style="display: flex; justify-content: center; align-items: center; gap: 10px;">
@@ -215,14 +254,19 @@ with gr.Blocks(css="""
     gr.Markdown(_STAR_)
 
     with gr.Tabs() as main_tabs:
-        with gr.TabItem('Image-to-3D', id='tab_image_to_3d'):
-            gr.Markdown("Upload an image and click 'Generate 3D Model' to create a 3D mesh.")
+        with gr.TabItem('Multi-View Image-to-3D', id='tab_mv_image_to_3d'):
+            gr.Markdown("Upload front, back, left, and right view images and click 'Generate 3D Model' to create a 3D mesh.")
             with gr.Row():
                 with gr.Column(scale=1):
-                    input_image = gr.Image(label="Input Image", type="pil", interactive=True)
+                    with gr.Row():
+                        front_img = gr.Image(label="Front View", type="pil", interactive=True)
+                        back_img = gr.Image(label="Back View", type="pil", interactive=True)
+                    with gr.Row():
+                        left_img = gr.Image(label="Left View", type="pil", interactive=True)
+                        right_img = gr.Image(label="Right View", type="pil", interactive=True)
                     
                     with gr.Accordion("Advanced Parameters", open=False):
-                        seed = gr.Number(value=666, label="Seed")
+                        seed = gr.Number(value=4242, label="Seed")
                         strength1 = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05, label="Strength 1")
                         strength2 = gr.Slider(minimum=0.0, maximum=1.0, value=0.95, step=0.05, label="Strength 2")
                         enable_redux = gr.Checkbox(value=True, label="Enable Redux")
@@ -238,11 +282,11 @@ with gr.Blocks(css="""
 
     # Button Click Events
     btn_generate.click(
-        fn=image2mesh_preprocess_,
-        inputs=[input_image, seed],
+        fn=mv_image2mesh_preprocess_,
+        inputs=[front_img, back_img, left_img, right_img, seed],
         outputs=[output_image, gr.Textbox(visible=False)]
     ).then(
-        fn=image2mesh_main_,
+        fn=mv_image2mesh_main_,
         inputs=[output_image, gr.Textbox(visible=False), seed, strength1, strength2, enable_redux, use_controlnet],
         outputs=[output_image, output_mesh, download_btn]
     ).then(

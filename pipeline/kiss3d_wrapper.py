@@ -103,11 +103,12 @@ def init_wrapper_from_config(config_path):
 
     # init multiview model
     logger.info('==> Loading multiview diffusion model ...')
-    multiview_device = config_['multiview'].get('device', 'cpu')
+    multiview_device = config_['multiview'].get('device', 'cuda:0')
     multiview_pipeline = DiffusionPipeline.from_pretrained(
         config_['multiview']['base_model'], 
         custom_pipeline=config_['multiview']['custom_pipeline'],
         torch_dtype=torch.float16,
+        device_map="balanced"
     )
     multiview_pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
         multiview_pipeline.scheduler.config, timestep_spacing='trailing'
@@ -118,9 +119,9 @@ def init_wrapper_from_config(config_path):
         state_dict = torch.load(unet_ckpt_path, map_location='cpu')
         multiview_pipeline.unet.load_state_dict(state_dict, strict=True)
 
-    multiview_pipeline.to(multiview_device)
+    #multiview_pipeline.to(multiview_device)
     # logger.warning(f"GPU memory allocated after load multiview model on {multiview_device}: {torch.cuda.memory_allocated(device=multiview_device) / 1024**3} GB")
-    multiview_pipeline = None
+    # multiview_pipeline = None
 
 
     # load caption model
@@ -298,8 +299,8 @@ class kiss3d_wrapper(object):
 
     def generate_multiview(self, image, seed=None, num_inference_steps=None):
         seed = seed or self.config['multiview'].get('seed', 0)
-        mv_device = self.config['multiview'].get('device', 'cpu')
-        self.multiview_pipeline.to(mv_device)
+        mv_device = self.config['multiview'].get('device', 'cuda:0')
+        #self.multiview_pipeline.to(mv_device)
         generator = torch.Generator(device=mv_device).manual_seed(seed)
         with self.context():
             mv_image = self.multiview_pipeline(image, 
@@ -307,7 +308,7 @@ class kiss3d_wrapper(object):
                                                width=512*2, 
                                                height=512*2,
                                                generator=generator).images[0]
-        self.multiview_pipeline.to('cpu')
+        #self.multiview_pipeline.to('cpu')
         return mv_image
 
     def reconstruct_from_multiview(self, mv_image, lrm_render_radius=4.15):
