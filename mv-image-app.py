@@ -9,8 +9,8 @@ for module_name in modules_to_reload:
         importlib.reload(sys.modules[module_name])
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+#os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
 
 sys.path.insert(0, 'custom_diffusers')
 
@@ -23,6 +23,8 @@ import torch
 import argparse
 import torchvision
 import numpy as np
+import gc
+
 from PIL import Image
 print(f'gradio version: {gr.__version__}')
 
@@ -39,12 +41,15 @@ processed_image = False
 
 @spaces.GPU
 def check_gpu():
+    gc.collect()
+    torch.cuda.empty_cache()
+
     print(f"torch.cuda.is_available:{torch.cuda.is_available()}")
     print("Device count:", torch.cuda.device_count()) 
 
     # test nvdiffrast
     import nvdiffrast.torch as dr
-    dr.RasterizeCudaContext(device="cuda:0")
+    dr.RasterizeCudaContext(device="cuda:1")
     print("nvdiffrast initialized successfully")       
 
 # Only check GPU in non-UI debug mode
@@ -84,6 +89,25 @@ TEMP_MESH_ADDRESS=''
 mesh_cache = None
 preprocessed_input_image = None
 
+def get_vram_usage(device_id=0):
+    """
+    Measures VRAM usage on a specified CUDA device.
+
+    Args:
+        device_id (int, optional): The ID of the CUDA device. Defaults to 0.
+
+    Returns:
+        tuple: A tuple containing allocated VRAM, reserved VRAM, and total VRAM, all in GB.
+    """
+    if not torch.cuda.is_available():
+        raise Exception("CUDA is not available.")
+
+    allocated_vram = torch.cuda.memory_allocated(device_id) / (1024**3)  # Convert to GB
+    reserved_vram = torch.cuda.memory_reserved(device_id) / (1024**3)  # Convert to GB
+    total_vram = torch.cuda.get_device_properties(device_id).total_memory / (1024**3) # Convert to GB
+
+    return allocated_vram, reserved_vram, total_vram
+
 def save_cached_mesh():
     global mesh_cache
     print('save_cached_mesh() called')
@@ -118,22 +142,34 @@ def mv_image2mesh_preprocess_(front_img, back_img, left_img, right_img, seed):
     global preprocessed_input_image
 
     print (f"mv_image2mesh_preprocess_() called with seed: {seed}")
+    
+    allocated_vram, reserved_vram, total_vram = get_vram_usage()
+    print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+    allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
+    print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+
     seed = int(seed) if seed is not None else None
     
     # Combine the multi-view images into a bundle
     reference_3d_bundle_image, reference_save_path = combine_multi_view_images(front_img, back_img, left_img, right_img)
-    
-    # Use front image for captioning and set as preprocessed input
     preprocessed_input_image = front_img
-    caption = k3d_wrapper.get_image_caption(front_img)
-    
-    return reference_save_path, caption
+
+    allocated_vram, reserved_vram, total_vram = get_vram_usage()
+    print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+    allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
+    print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+
+    return reference_save_path
 
 @spaces.GPU(duration=120)
-def mv_image2mesh_main_(reference_3d_bundle_image, caption, seed, strength1=0.5, strength2=0.95, enable_redux=True, use_controlnet=True):
+def mv_image2mesh_main_(reference_3d_bundle_image, strength1=0.5, strength2=0.95, enable_redux=True):
     global mesh_cache 
-    print (f"mv_image2mesh_main_() called with seed: {caption}")
-    seed = int(seed) if seed is not None else None
+    print (f"mv_image2mesh_main_() called")
+
+    allocated_vram, reserved_vram, total_vram = get_vram_usage()
+    print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+    allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
+    print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
 
     # Convert reference image to tensor
     reference_3d_bundle_image = torch.tensor(reference_3d_bundle_image).permute(2,0,1)/255
@@ -143,15 +179,18 @@ def mv_image2mesh_main_(reference_3d_bundle_image, caption, seed, strength1=0.5,
         k3d_wrapper, 
         preprocessed_input_image,  # Use the preprocessed input image
         reference_3d_bundle_image, 
-        caption=caption, 
-        seed=seed, 
         strength1=strength1, 
         strength2=strength2, 
-        enable_redux=enable_redux, 
-        use_controlnet=use_controlnet
+        enable_redux=enable_redux
     )
     
     mesh_cache = recon_mesh_path
+
+    allocated_vram, reserved_vram, total_vram = get_vram_usage()
+    print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+    allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
+    print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
+
     return gen_save_path, recon_mesh_path, mesh_cache
 
 if not UI_ONLY_MODE:
@@ -284,10 +323,10 @@ with gr.Blocks(css="""
     btn_generate.click(
         fn=mv_image2mesh_preprocess_,
         inputs=[front_img, back_img, left_img, right_img, seed],
-        outputs=[output_image, gr.Textbox(visible=False)]
+        outputs=[output_image]
     ).then(
         fn=mv_image2mesh_main_,
-        inputs=[output_image, gr.Textbox(visible=False), seed, strength1, strength2, enable_redux, use_controlnet],
+        inputs=[output_image, strength1, strength2, enable_redux],
         outputs=[output_image, output_mesh, download_btn]
     ).then(
         lambda: gr.Button(interactive=True),
