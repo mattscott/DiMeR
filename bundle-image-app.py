@@ -9,11 +9,6 @@ for module_name in modules_to_reload:
         importlib.reload(sys.modules[module_name])
 
 import os
-#os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-#os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
-
-sys.path.insert(0, 'custom_diffusers')
-
 import gradio as gr
 import subprocess
 import spaces
@@ -29,7 +24,7 @@ from PIL import Image
 print(f'gradio version: {gr.__version__}')
 
 # Add command line argument parsing
-parser = argparse.ArgumentParser(description='DiMeR Multi-View Image-to-3D Demo')
+parser = argparse.ArgumentParser(description='DiMeR Bundle Image-to-3D Demo')
 parser.add_argument('--ui_only', action='store_true', help='Only load the UI interface, do not initialize models (for UI debugging)')
 args = parser.parse_args()
 
@@ -87,7 +82,6 @@ if not UI_ONLY_MODE:
 
 TEMP_MESH_ADDRESS=''
 mesh_cache = None
-preprocessed_input_image = None
 
 def get_vram_usage(device_id=0):
     """
@@ -113,76 +107,43 @@ def save_cached_mesh():
     print('save_cached_mesh() called')
     return mesh_cache
 
-def combine_multi_view_images(front_img, back_img, left_img, right_img):
-    """Combine 4 view images into a single bundle image"""
-    # Convert PIL images to tensors
-    front_tensor = torchvision.transforms.functional.to_tensor(front_img)
-    back_tensor = torchvision.transforms.functional.to_tensor(back_img)
-    left_tensor = torchvision.transforms.functional.to_tensor(left_img)
-    right_tensor = torchvision.transforms.functional.to_tensor(right_img)
-    
-    # Stack images in the correct order (front, right, back, left)
-    rgb_images = torch.stack([front_tensor, left_tensor, back_tensor, right_tensor])
-    
-    # Create normal maps (placeholder for now)
-    normal_images = torch.ones_like(rgb_images)
-    
-    # Stack RGB and normal images vertically
-    bundle_image = torch.cat([rgb_images, normal_images], dim=0)
-    
-    # Create a grid with 4 images per row, but stack the normal images below
-    rgb_grid = torchvision.utils.make_grid(rgb_images, nrow=4, padding=0)
-    normal_grid = torchvision.utils.make_grid(normal_images, nrow=4, padding=0)
-    bundle_image = torch.cat([rgb_grid, normal_grid], dim=1)  # Stack vertically
-    
-    # Save intermediate result
-    save_path = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_ref_3d_bundle_image.png')
-    torchvision.utils.save_image(bundle_image, save_path)
-    
-    return bundle_image, save_path
-
 @spaces.GPU(duration=120)
-def mv_image2mesh_preprocess_(front_img, back_img, left_img, right_img, seed):
-    global preprocessed_input_image
-
-    print (f"mv_image2mesh_preprocess_() called with seed: {seed}")
-    
-    allocated_vram, reserved_vram, total_vram = get_vram_usage()
-    print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
-    allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
-    print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
-
-    seed = int(seed) if seed is not None else None
-    
-    # Combine the multi-view images into a bundle
-    reference_3d_bundle_image, reference_save_path = combine_multi_view_images(front_img, back_img, left_img, right_img)
-    preprocessed_input_image = front_img
-
-    allocated_vram, reserved_vram, total_vram = get_vram_usage()
-    print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
-    allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
-    print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
-
-    return reference_save_path
-
-@spaces.GPU(duration=120)
-def mv_image2mesh_main_(reference_3d_bundle_image, strength1=0.5, strength2=0.95, enable_redux=True):
+def bundle_image2mesh_(bundle_image, strength1=0.5, strength2=0.95, enable_redux=True):
     global mesh_cache 
-    print (f"mv_image2mesh_main_() called")
+    print (f"bundle_image2mesh_() called")
 
     allocated_vram, reserved_vram, total_vram = get_vram_usage()
     print(f"#0 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
     allocated_vram, reserved_vram, total_vram = get_vram_usage(device_id=1)
     print(f"#1 VRAM Usage: Allocated={allocated_vram:.2f}GB, Reserved={reserved_vram:.2f}GB, Total={total_vram:.2f}GB")
 
-    # Convert reference image to tensor
-    reference_3d_bundle_image = torch.tensor(reference_3d_bundle_image).permute(2,0,1)/255
-
+    # Convert bundle image to PIL Image for input
+    input_pil = Image.fromarray(bundle_image)
+    
+    # Convert bundle image to tensor and split into individual views for reference
+    bundle_tensor = torch.tensor(bundle_image).permute(2,0,1)/255  # Convert to C,H,W format
+    
+    # Split into RGB and normal views
+    rgb_views = []
+    normal_views = []
+    for i in range(4):  # 4 views
+        # Extract RGB view (top row)
+        rgb_view = bundle_tensor[:, :512, i*512:(i+1)*512]
+        rgb_views.append(rgb_view)
+        
+        # Extract normal view (bottom row)
+        normal_view = bundle_tensor[:, 512:, i*512:(i+1)*512]
+        normal_views.append(normal_view)
+    
+    # Stack views into tensors
+    rgb_tensor = torch.stack(rgb_views)  # Shape: [4, C, H, W]
+    normal_tensor = torch.stack(normal_views)  # Shape: [4, C, H, W]
+    
     # Generate 3D model
     gen_save_path, recon_mesh_path = image2mesh_main(
         k3d_wrapper, 
-        preprocessed_input_image,  # Use the preprocessed input image
-        reference_3d_bundle_image, 
+        input_pil,  # Pass as PIL Image for input
+        bundle_tensor,  # Pass full bundle tensor as reference
         strength1=strength1, 
         strength2=strength2, 
         enable_redux=enable_redux
@@ -245,7 +206,7 @@ with gr.Blocks(css="""
         with gr.Column(scale=7, elem_id="center-align-column"):
             gr.Markdown(f"""
             # Official 🤗 Gradio Demo
-            # DiMeR: Multi-View Image-to-3D Generation""")
+            # DiMeR: Bundle Image-to-3D Generation""")
             
             gr.HTML(f"""
             <div style="display: flex; justify-content: center; align-items: center; gap: 10px;">
@@ -297,24 +258,16 @@ with gr.Blocks(css="""
     gr.Markdown(_STAR_)
 
     with gr.Tabs() as main_tabs:
-        with gr.TabItem('Multi-View Image-to-3D', id='tab_mv_image_to_3d'):
-            gr.Markdown("Upload front, back, left, and right view images and click 'Generate 3D Model' to create a 3D mesh.")
+        with gr.TabItem('Bundle Image-to-3D', id='tab_bundle_image_to_3d'):
+            gr.Markdown("Upload a processed bundle image (containing RGB and normal maps) and click 'Generate 3D Model' to create a 3D mesh.")
             with gr.Row():
                 with gr.Column(scale=1):
-                    with gr.Row():
-                        front_img = gr.Image(label="Front View", type="pil", interactive=True)
-                        back_img = gr.Image(label="Back View", type="pil", interactive=True)
-                    with gr.Row():
-                        left_img = gr.Image(label="Left View", type="pil", interactive=True)
-                        right_img = gr.Image(label="Right View", type="pil", interactive=True)
+                    bundle_image = gr.Image(label="Bundle Image", type="numpy", interactive=True)
                     
                     with gr.Accordion("Advanced Parameters", open=False):
-                        seed = gr.Number(value=4242, label="Seed")
                         strength1 = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05, label="Strength 1")
                         strength2 = gr.Slider(minimum=0.0, maximum=1.0, value=0.95, step=0.05, label="Strength 2")
                         enable_redux = gr.Checkbox(value=True, label="Enable Redux")
-                        use_controlnet = gr.Checkbox(value=True, label="Use ControlNet")
-                        camera_radius = gr.Slider(minimum=3.0, maximum=6.0, value=3.5, step=0.01, label="Camera Radius")
                     
                     btn_generate = gr.Button("Generate 3D Model", elem_classes=["orange-button"])
 
@@ -325,12 +278,8 @@ with gr.Blocks(css="""
 
     # Button Click Events
     btn_generate.click(
-        fn=mv_image2mesh_preprocess_,
-        inputs=[front_img, back_img, left_img, right_img, seed],
-        outputs=[output_image]
-    ).then(
-        fn=mv_image2mesh_main_,
-        inputs=[output_image, strength1, strength2, enable_redux],
+        fn=bundle_image2mesh_,
+        inputs=[bundle_image, strength1, strength2, enable_redux],
         outputs=[output_image, output_mesh, download_btn]
     ).then(
         lambda: gr.Button(interactive=True),
