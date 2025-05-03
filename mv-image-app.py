@@ -127,9 +127,13 @@ def combine_multi_view_images(front_img, back_img, left_img, right_img):
     # Create normal maps (placeholder for now)
     normal_images = torch.ones_like(rgb_images)
     
-    # Combine into final bundle image
+    # Stack RGB and normal images vertically
     bundle_image = torch.cat([rgb_images, normal_images], dim=0)
-    bundle_image = torchvision.utils.make_grid(bundle_image, nrow=4, padding=0)
+    
+    # Create a grid with 4 images per row, but stack the normal images below
+    rgb_grid = torchvision.utils.make_grid(rgb_images, nrow=4, padding=0)
+    normal_grid = torchvision.utils.make_grid(normal_images, nrow=4, padding=0)
+    bundle_image = torch.cat([rgb_grid, normal_grid], dim=1)  # Stack vertically
     
     # Save intermediate result
     save_path = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_ref_3d_bundle_image.png')

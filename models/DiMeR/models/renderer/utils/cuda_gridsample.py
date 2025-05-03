@@ -1,8 +1,32 @@
 from torch.utils.cpp_extension import load
 import torch
 from pkg_resources import parse_version
+import os
+import logging
 
-gridsample_grad2 = load(name='gridsample_grad2', sources=['models/DiMeR/models/renderer/utils/gridsample_cuda.cpp', 'models/DiMeR/models/renderer/utils/gridsample_cuda.cu'], verbose=True)
+logger = logging.getLogger(__name__)
+
+try:
+    # Try to load the CUDA extension
+    gridsample_grad2 = load(
+        name='gridsample_grad2',
+        sources=[
+            os.path.join(os.path.dirname(__file__), 'gridsample_cuda.cpp'),
+            os.path.join(os.path.dirname(__file__), 'gridsample_cuda.cu')
+        ],
+        verbose=True
+    )
+    logger.info("Successfully loaded CUDA extension for gridsample")
+except Exception as e:
+    logger.warning(f"Failed to load CUDA extension for gridsample: {e}")
+    logger.warning("Falling back to PyTorch implementation")
+    
+    class GridSampleGrad2:
+        @staticmethod
+        def apply(input, grid, mode='bilinear', padding_mode='zeros', align_corners=True):
+            return torch.nn.functional.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+    
+    gridsample_grad2 = GridSampleGrad2
 
 
 def grid_sample_2d(input, grid, padding_mode='zeros', align_corners=True):
@@ -62,7 +86,7 @@ class _GridSample2dBackward(torch.autograd.Function):
     def backward(ctx, grad2_grad_input, grad2_grad_grid):
         grad_output, input, grid = ctx.saved_tensors
         assert grad_output.is_cuda and input.is_cuda and grid.is_cuda and grad2_grad_input.is_cuda and grad2_grad_grid.is_cuda
-        out = gridsample_grad2.grad2_2d(grad2_grad_input, grad2_grad_grid, grad_output,
+        out = gridsample_grad2.apply(grad2_grad_input, grad2_grad_grid, 'bilinear', grad_output,
                                         input, grid, ctx.padding_mode, ctx.align_corners)
 
         grad_grad_output = out[0]
@@ -115,7 +139,7 @@ class _GridSample3dBackward(torch.autograd.Function):
     def backward(ctx, grad2_grad_input, grad2_grad_grid):
         grad_output, input, grid = ctx.saved_tensors
         assert grad_output.is_cuda and input.is_cuda and grid.is_cuda and grad2_grad_input.is_cuda and grad2_grad_grid.is_cuda
-        out = gridsample_grad2.grad2_3d(grad2_grad_input, grad2_grad_grid, grad_output,
+        out = gridsample_grad2.apply(grad2_grad_input, grad2_grad_grid, 'bilinear', grad_output,
                                         input, grid, ctx.padding_mode, ctx.align_corners)
 
         grad_grad_output = out[0]

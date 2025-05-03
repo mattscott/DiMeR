@@ -116,6 +116,9 @@ class kiss3d_wrapper:
         recon_model = self.model_loader.load_reconstruction_model()
         recon_device = self.config['reconstruction'].get('device', 'cuda:1')
 
+        # Load the reconstruction config file
+        recon_config = OmegaConf.load(self.config['reconstruction']['model_config'])
+
         # split rgb and normal
         images = rearrange(image, 'c (n h) (m w) -> (n m) c h w', n=2, m=4)
         rgb_multi_view, normal_multi_view = images.chunk(2, dim=0)
@@ -123,12 +126,13 @@ class kiss3d_wrapper:
         rgb_multi_view = rgb_multi_view.to(recon_device) * multi_view_mask + (1 - multi_view_mask)
         
         with self.context():
-            result = DiMeR_reconstruct(recon_model, self.config['reconstruction']['model_config'],
+            result = DiMeR_reconstruct(recon_model, recon_config,
                                     self.model_loader.load_texture_model(), self.config['texture']['model_config'],
                                     rgb_multi_view.to(recon_device), normal_multi_view.to(recon_device), 
                                     name=self.uuid, input_camera_type='kiss3d', 
                                     render_3d_bundle_image=save_intermediate_results,
                                     render_azimuths=[0, 90, 180, 270],
+                                    render_elevations=[5, 5, 5, 5],
                                     render_radius=lrm_render_radius,
                                     camera_radius=camera_radius)
         
@@ -147,27 +151,51 @@ class kiss3d_wrapper:
         else:
             # Convert tensor to PIL Image if needed
             if isinstance(image, torch.Tensor):
-                # Remove batch dimension if present and convert from (C, H, W) to (H, W, C)
+                # Remove batch dimension if present
                 if image.dim() == 4:
                     image = image.squeeze(0)  # Remove batch dimension
-                image = image.permute(1, 2, 0).mul(255).byte().cpu().numpy()
-                image = Image.fromarray(image)
+                
+                # Split into individual views
+                width = image.shape[2] // 4  # Each view is 1/4 of the width
+                views = []
+                for i in range(4):
+                    view = image[:, :, i*width:(i+1)*width]
+                    # Convert to PIL Image
+                    view = view.permute(1, 2, 0).mul(255).byte().cpu().numpy()
+                    views.append(Image.fromarray(view))
 
         with self.context():
-            # Apply the model to the image
-            gen_3d_bundle_image = normals_pipe(image, data_type="object")  # Will mask out background, if alpha channel is available, else use birefnet
+            # Process each view separately
+            normal_views = []
+            for view in views:
+                normal_view = normals_pipe(view, data_type="object")
+                normal_views.append(normal_view)
 
-        # Convert PIL Image to tensor
-        gen_3d_bundle_image_ = torchvision.transforms.functional.to_tensor(gen_3d_bundle_image)
+        # Convert normal views to tensors and combine
+        normal_tensors = []
+        for normal_view in normal_views:
+            normal_tensor = torchvision.transforms.functional.to_tensor(normal_view)
+            normal_tensors.append(normal_tensor)
+        
+        # Stack normal tensors horizontally
+        normal_images = torch.stack(normal_tensors)
+        normal_grid = torchvision.utils.make_grid(normal_images, nrow=4, padding=0)
+
+        # Create the final bundle by stacking RGB and normal grids vertically
+        # First, create a grid of the original RGB images
+        rgb_grid = torchvision.utils.make_grid(image.unsqueeze(0), nrow=4, padding=0)
+        
+        # Stack RGB and normal grids vertically
+        bundle_image = torch.cat([rgb_grid, normal_grid], dim=1)  # Stack vertically
 
         if save_intermediate_results:
             save_path = os.path.join(TMP_DIR, f'{self.uuid}_gen_3d_bundle_image.png')
-            torchvision.utils.save_image(gen_3d_bundle_image_, save_path)
+            torchvision.utils.save_image(bundle_image, save_path)
             logger.info(f"Save generated 3D bundle image to {save_path}")
-            return gen_3d_bundle_image_, save_path
+            return bundle_image, save_path
 
         self.model_loader.unload_model('normals')
-        return gen_3d_bundle_image_
+        return bundle_image
 
     def preprocess_controlnet_cond_image(self, image, mode, down_scale=1, kernel_size=51, sigma=2.0):
         """Preprocess image for controlnet conditioning"""
@@ -200,17 +228,21 @@ def image2mesh_main(k3d_wrapper, input_image, reference_3d_bundle_image, strengt
     else:
         redux_hparam = None
 
+    # Extract just the RGB images (top row) from the bundle
+    height = reference_3d_bundle_image.shape[1] // 2  # Get half the height
+    rgb_images = reference_3d_bundle_image[:, :height, :]  # Take top half
+    
     # Convert tensor back to PIL Image for preprocessing
-    reference_pil = torchvision.transforms.ToPILImage()(reference_3d_bundle_image)
+    reference_pil = torchvision.transforms.ToPILImage()(rgb_images)
     
     gen_3d_bundle_image, gen_save_path = k3d_wrapper.generate_3d_bundle_image_normals(
-        image=reference_3d_bundle_image.unsqueeze(0),
+        image=rgb_images.unsqueeze(0),
     )
 
     # recon from 3D Bundle image
     recon_mesh_path = k3d_wrapper.reconstruct_3d_bundle_image(gen_3d_bundle_image, save_intermediate_results=True)
 
-    return gen_save_path, recon_mesh_path 
+    return gen_save_path, recon_mesh_path
 
 def init_wrapper_from_config(config_path):
     model_loader = ModelLoader(config_path)
