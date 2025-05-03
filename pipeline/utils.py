@@ -258,6 +258,8 @@ def DiMeR_reconstruct(model, infer_config, texture_model, texture_model_config, 
         image = images[i].permute(1, 2, 0).cpu().numpy()
         image = (image * 255).astype(np.uint8)
         image = rembg.remove(image, session=rembg_session)
+        # Make a writable copy of the array
+        image = np.copy(image)
         image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.
         image = image[3:4]
         fg_mask.append(image)

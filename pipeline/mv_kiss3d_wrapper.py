@@ -54,15 +54,19 @@ class ModelLoader:
     def load_reconstruction_model(self):
         if 'reconstruction' not in self.models:
             logger.info('==> Loading reconstruction model ...')
-            recon_device = self.config['reconstruction'].get('device', 'cuda:1')
+            recon_device = self.config['reconstruction'].get('device', 'cuda:0')
             recon_model_config = OmegaConf.load(self.config['reconstruction']['model_config'])
             recon_model = instantiate_from_config(recon_model_config.model_config)
             model_ckpt_path = hf_hub_download(repo_id="LutaoJiang/DiMeR", filename="DiMeR_geometry.ckpt", repo_type="model")
-            state_dict = torch.load(model_ckpt_path, map_location='cuda:1')
+            state_dict = torch.load(model_ckpt_path, map_location='cuda:0')
             state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.')}
             recon_model.load_state_dict(state_dict, strict=True)
             recon_model.to(recon_device)
             recon_model.eval()
+            
+            # Initialize the geometry
+            logger.info('==> Initializing DiMeR geometry ...')
+            recon_model.init_flexicubes_geometry(recon_device)
             
             self.models['reconstruction'] = recon_model
         return self.models['reconstruction']
@@ -70,11 +74,14 @@ class ModelLoader:
     def load_texture_model(self):
         if 'texture' not in self.models:
             logger.info('==> Loading texture model ...')
-            texture_device = self.config['texture'].get('device', 'cuda:1')
+            # Force using cuda:0 for texture model
+            texture_device = 'cuda:0'
+            logger.info(f'==> Using device {texture_device} for texture model')
+            
             texture_model_config = OmegaConf.load(self.config['texture']['model_config'])
             texture_model = instantiate_from_config(texture_model_config.model_config)
             model_ckpt_path = hf_hub_download(repo_id="LutaoJiang/DiMeR", filename="DiMeR_texture.ckpt", repo_type="model")
-            state_dict = torch.load(model_ckpt_path, map_location='cuda:1')
+            state_dict = torch.load(model_ckpt_path, map_location='cuda:0')
             state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.')}
             texture_model.load_state_dict(state_dict, strict=True)
             texture_model.to(texture_device)
@@ -114,7 +121,8 @@ class kiss3d_wrapper:
     def reconstruct_3d_bundle_image(self, image, camera_radius=3.5, lrm_render_radius=4.15, isomer_radius=4.5, 
                                   reconstruction_stage1_steps=0, reconstruction_stage2_steps=20, save_intermediate_results=True):
         recon_model = self.model_loader.load_reconstruction_model()
-        recon_device = self.config['reconstruction'].get('device', 'cuda:1')
+        texture_model = self.model_loader.load_texture_model()
+        device = 'cuda:0'  # Force using cuda:0 for all operations
 
         # Load the reconstruction config file
         recon_config = OmegaConf.load(self.config['reconstruction']['model_config'])
@@ -122,13 +130,13 @@ class kiss3d_wrapper:
         # split rgb and normal
         images = rearrange(image, 'c (n h) (m w) -> (n m) c h w', n=2, m=4)
         rgb_multi_view, normal_multi_view = images.chunk(2, dim=0)
-        multi_view_mask = get_background(normal_multi_view).to(recon_device)
-        rgb_multi_view = rgb_multi_view.to(recon_device) * multi_view_mask + (1 - multi_view_mask)
+        multi_view_mask = get_background(normal_multi_view).to(device)
+        rgb_multi_view = rgb_multi_view.to(device) * multi_view_mask + (1 - multi_view_mask)
         
         with self.context():
             result = DiMeR_reconstruct(recon_model, recon_config,
-                                    self.model_loader.load_texture_model(), self.config['texture']['model_config'],
-                                    rgb_multi_view.to(recon_device), normal_multi_view.to(recon_device), 
+                                    texture_model, self.config['texture']['model_config'],
+                                    rgb_multi_view.to(device), normal_multi_view.to(device), 
                                     name=self.uuid, input_camera_type='kiss3d', 
                                     render_3d_bundle_image=save_intermediate_results,
                                     render_azimuths=[0, 90, 180, 270],

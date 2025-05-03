@@ -19,11 +19,11 @@ multiview:
 
 reconstruction:
   model_config: "./models/DiMeR/config/DiMeR_default.yaml"
-  device: 'cuda:1'
+  device: 'cuda:0'
 
 texture:
   model_config: "./models/DiMeR/config/DiMeR_default.yaml"
-  device: 'cuda:1'
+  device: 'cuda:0'
 
 caption:
   base_model: "multimodalart/Florence-2-large-no-flash-attn"
